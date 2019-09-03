@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,7 +90,13 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 	)
 	defer span.Finish()
 
-	i, err := strconv.Atoi(req.URL.Query()["i"])
+	var err error
+	var i int
+	if len(req.URL.Query()["i"]) != 1 {
+		err = fmt.Errorf("Wrong number of arguments.")
+	} else {
+		i, err = strconv.Atoi(req.URL.Query()["i"][0])
+	}
 	if err != nil {
 		fmt.Fprintf(w, "Couldn't parse index '%s'.", req.URL.Query()["i"])
 		w.WriteHeader(503)
@@ -103,9 +112,10 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 		// Call /fib?i=(n-1) and /fib?i=(n-2) and add them together.
 		var mtx sync.Mutex
 		var wg sync.WaitGroup
-		for offset := 0; offset < 2; offset++ {
+		client := http.DefaultClient
+		for offset := 1; offset < 3; offset++ {
 			wg.Add(1)
-			go func(n) {
+			go func(n int) {
 				err := tracer.WithSpan(ctx, "fibClient", func(ctx context.Context) error {
 					url := fmt.Sprintf("http://localhost:3000/fib?i=%d", n)
 					req, _ := http.NewRequest("GET", url, nil)
@@ -115,12 +125,12 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 					if err != nil {
 						return err
 					}
-					body, err = ioutil.ReadAll(res.Body)
+					body, err := ioutil.ReadAll(res.Body)
 					res.Body.Close()
 					if err != nil {
 						return err
 					}
-					resp, err := strconv.Atoi(body)
+					resp, err := strconv.Atoi(string(body))
 					if err != nil {
 						return err
 					}
@@ -138,8 +148,8 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 				wg.Done()
 			}(i - offset)
 		}
+		wg.Wait()
 	}
-	wg.Wait()
 	fmt.Fprintf(w, "%d", ret)
 }
 
@@ -158,9 +168,11 @@ func updateDiskMetrics(ctx context.Context, used, quota metric.Float64Gauge) {
 }
 
 func main() {
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/fib", fibHandler)
-	http.HandleFunc("/quitquitquit", restartHandler)
+	mux := http.NewServeMux()
+	mux.Handle("/", http.HandlerFunc(rootHandler))
+	mux.Handle("/favicon.ico", http.NotFoundHandler())
+	mux.Handle("/fib", http.HandlerFunc(fibHandler))
+	mux.Handle("/quitquitquit", http.HandlerFunc(restartHandler))
 	os.Stderr.WriteString("Initializing the server...\n")
 
 	ctx := tag.NewContext(context.Background(),
@@ -173,7 +185,7 @@ func main() {
 
 	go updateDiskMetrics(ctx, used, quota)
 
-	err := http.ListenAndServe(":3000", nil)
+	err := http.ListenAndServe(":3000", mux)
 	if err != nil {
 		log.Fatalf("Could not start web server: %s", err)
 	}
