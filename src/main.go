@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+  "net"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,19 +14,21 @@ import (
 	"time"
 
 	"github.com/honeycombio/opentelemetry-exporter-go/honeycomb"
+	"go.opentelemetry.io/exporter/trace/jaeger"
+	sdktrace "go.opentelemetry.io/sdk/trace"
 	"google.golang.org/grpc/codes"
 
-	"go.opentelemetry.io/api/key"
+  "go.opentelemetry.io/api/core"
+  "go.opentelemetry.io/api/key"
 	"go.opentelemetry.io/api/metric"
 	"go.opentelemetry.io/api/tag"
 	"go.opentelemetry.io/api/trace"
 	"go.opentelemetry.io/plugin/httptrace"
-	// _ "go.opentelemetry.io/experimental/streaming/exporter/stderr/install"
+  "go.opentelemetry.io/plugin/othttp"
+	"go.opentelemetry.io/exporter/trace/stdout"
 )
 
 var (
-	tracer trace.Tracer
-
 	appKey         = key.New("honeycomb.io/glitch/app")          // The Glitch app name.
 	containerKey   = key.New("honeycomb.io/glitch/container_id") // The Glitch container id.
 	diskUsedMetric = metric.NewFloat64Gauge("honeycomb.io/glitch/disk_usage",
@@ -39,52 +42,74 @@ var (
 	meter = metric.GlobalMeter()
 )
 
-func dbHandler(ctx context.Context, color string) int {
-	ctx, span := tracer.Start(ctx, "database")
-	defer span.End()
+func main() {
+	serviceName, _ := os.LookupEnv("PROJECT_NAME")
 
-	// Pretend we talked to a database here.
-	return 0
-}
+	std, err := stdout.NewExporter(stdout.Options{PrettyPrint: true})
+	if err != nil {
+		log.Fatal(err)
+	}
+	sdktrace.RegisterSpanProcessor(sdktrace.NewSimpleSpanProcessor(std))
 
-func restartHandler(w http.ResponseWriter, req *http.Request) {
-	os.Exit(0)
+	apikey, _ := os.LookupEnv("HNY_KEY")
+	dataset, _ := os.LookupEnv("HNY_DATASET")
+	hny := honeycomb.NewExporter(honeycomb.Config{
+		ApiKey:      apikey,
+		Dataset:     dataset,
+		Debug:       false,
+		ServiceName: serviceName,
+	})
+	defer hny.Close()
+	hny.Register()
+
+	jaegerEndpoint, _ := os.LookupEnv("JAEGER_ENDPOINT")
+	jExporter, err := jaeger.NewExporter(
+		jaeger.WithCollectorEndpoint(jaegerEndpoint),
+		jaeger.WithProcess(jaeger.Process{
+			ServiceName: serviceName,
+		}),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	sdktrace.RegisterSpanProcessor(sdktrace.NewSimpleSpanProcessor(jExporter))
+
+	mux := http.NewServeMux()
+  mux.Handle("/", othttp.NewHandler(http.HandlerFunc(rootHandler), "root"))
+	mux.Handle("/favicon.ico", http.NotFoundHandler())
+  // TODO(lizf): Pass WithPublicEndpoint() for /fib and no WithPublicEndpoint() for /fibinternal
+  mux.Handle("/fib", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci"))
+	mux.Handle("/quitquitquit", http.HandlerFunc(restartHandler))
+	os.Stderr.WriteString("Initializing the server...\n")
+
+	ctx := tag.NewContext(context.Background(),
+		tag.Insert(appKey.String(os.Getenv("PROJECT_DOMAIN"))),
+		tag.Insert(containerKey.String(os.Getenv("HOSTNAME"))),
+	)
+
+	commonLabels := meter.DefineLabels(ctx, appKey.Int(10))
+
+	used := diskUsedMetric.GetHandle(commonLabels)
+	quota := diskQuotaMetric.GetHandle(commonLabels)
+
+	go updateDiskMetrics(ctx, used, quota)
+
+	err = http.ListenAndServe(":3000", mux)
+	if err != nil {
+		log.Fatalf("Could not start web server: %s", err)
+	}
 }
 
 func rootHandler(w http.ResponseWriter, req *http.Request) {
-	attrs, tags, spanCtx := httptrace.Extract(req.Context(), req)
-
-	req = req.WithContext(tag.WithMap(req.Context(), tag.NewMap(tag.MapUpdate{
-		MultiKV: tags,
-	})))
-
-	ctx, span := tracer.Start(
-		req.Context(),
-		"root",
-		trace.WithAttributes(attrs...),
-		trace.ChildOf(spanCtx),
-	)
-	defer span.End()
-
-	span.AddEvent(ctx, "annotation within span")
+  ctx := req.Context()
+  trace.CurrentSpan(ctx).AddEvent(ctx, "annotation within span")
 	_ = dbHandler(ctx, "foo")
 
 	fmt.Fprintf(w, "Click [Tools] > [Logs] to see spans!")
 }
 
 func fibHandler(w http.ResponseWriter, req *http.Request) {
-	attrs, tags, spanCtx := httptrace.Extract(req.Context(), req)
-	req = req.WithContext(tag.WithMap(req.Context(), tag.NewMap(tag.MapUpdate{
-		MultiKV: tags,
-	})))
-	ctx, span := tracer.Start(
-		req.Context(),
-		"fibonacci",
-		trace.WithAttributes(attrs...),
-		trace.ChildOf(spanCtx),
-	)
-	defer span.End()
-
+  ctx := req.Context()
 	var err error
 	var i int
 	if len(req.URL.Query()["i"]) != 1 {
@@ -95,10 +120,9 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		fmt.Fprintf(w, "Couldn't parse index '%s'.", req.URL.Query()["i"])
 		w.WriteHeader(503)
-		// This shouldn't be necessary in a finished OTel http auto-instrument.
-		span.SetStatus(codes.InvalidArgument)
 		return
 	}
+  trace.CurrentSpan(ctx).SetAttribute(key.New("parameter").Int(i))
 	ret := 0
 	failed := false
 
@@ -112,8 +136,9 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 		for offset := 1; offset < 3; offset++ {
 			wg.Add(1)
 			go func(n int) {
-				err := tracer.WithSpan(ctx, "fibClient", func(ctx context.Context) error {
+				err := trace.GlobalTracer().WithSpan(ctx, "fibClient", func(ctx context.Context) error {
 					url := fmt.Sprintf("http://localhost:3000/fib?i=%d", n)
+          trace.CurrentSpan(ctx).SetAttributes(key.New("url").String(url))
 					req, _ := http.NewRequest("GET", url, nil)
 					ctx, req = httptrace.W3C(ctx, req)
 					httptrace.Inject(ctx, req)
@@ -131,6 +156,7 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 						return err
 					}
 					trace.CurrentSpan(ctx).SetStatus(codes.OK)
+          trace.CurrentSpan(ctx).SetAttributes(key.New("result").Int(resp))
 					mtx.Lock()
 					defer mtx.Unlock()
 					ret += resp
@@ -142,17 +168,17 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 						failed = true
 					}
 					fmt.Fprintf(w, "Failed to call child index '%s'.\n", n)
-					span.SetStatus(codes.Internal)
 				}
 				wg.Done()
 			}(i - offset)
 		}
 		wg.Wait()
 	}
+  trace.CurrentSpan(ctx).SetAttribute(key.New("result").Int(ret))
 	fmt.Fprintf(w, "%d", ret)
 }
 
-func updateDiskMetrics(ctx context.Context, used, quota metric.Float64Gauge) {
+func updateDiskMetrics(ctx context.Context, used, quota metric.Float64GaugeHandle) {
 	for {
 		var stat syscall.Statfs_t
 		wd, _ := os.Getwd()
@@ -166,46 +192,14 @@ func updateDiskMetrics(ctx context.Context, used, quota metric.Float64Gauge) {
 	}
 }
 
-func main() {
-	apikey, _ := os.LookupEnv("HNY_KEY")
-	dataset, _ := os.LookupEnv("HNY_DATASET")
-  serviceName, _ := os.LookupEnv("PROJECT_NAME")
+func dbHandler(ctx context.Context, color string) int {
+	ctx, span := trace.GlobalTracer().Start(ctx, "database")
+	defer span.End()
 
-	exporter := honeycomb.NewExporter(honeycomb.Config{
-		ApiKey:      apikey,
-		Dataset:     dataset,
-		Debug:       false,
-		ServiceName: serviceName,
-	})
-	defer exporter.Close()
-	exporter.Register()
+	// Pretend we talked to a database here.
+	return 0
+}
 
-	tracer = trace.GlobalTracer().
-		WithService("server").
-		WithComponent("main").
-		WithResources(
-			key.New("whatevs").String("nooooo"),
-		)
-
-	mux := http.NewServeMux()
-	mux.Handle("/", http.HandlerFunc(rootHandler))
-	mux.Handle("/favicon.ico", http.NotFoundHandler())
-	mux.Handle("/fib", http.HandlerFunc(fibHandler))
-	mux.Handle("/quitquitquit", http.HandlerFunc(restartHandler))
-	os.Stderr.WriteString("Initializing the server...\n")
-
-	ctx := tag.NewContext(context.Background(),
-		tag.Insert(appKey.String(os.Getenv("PROJECT_DOMAIN"))),
-		tag.Insert(containerKey.String(os.Getenv("HOSTNAME"))),
-	)
-
-	used := meter.GetFloat64Gauge(ctx, diskUsedMetric)
-	quota := meter.GetFloat64Gauge(ctx, diskQuotaMetric)
-
-	go updateDiskMetrics(ctx, used, quota)
-
-	err := http.ListenAndServe(":3000", mux)
-	if err != nil {
-		log.Fatalf("Could not start web server: %s", err)
-	}
+func restartHandler(w http.ResponseWriter, req *http.Request) {
+	os.Exit(0)
 }
