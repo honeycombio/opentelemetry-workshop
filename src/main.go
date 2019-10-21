@@ -17,13 +17,13 @@ import (
 	sdktrace "go.opentelemetry.io/sdk/trace"
 	"google.golang.org/grpc/codes"
 
-  "go.opentelemetry.io/api/key"
+	"go.opentelemetry.io/api/distributedcontext"
+	"go.opentelemetry.io/api/key"
 	"go.opentelemetry.io/api/metric"
-	"go.opentelemetry.io/api/tag"
 	"go.opentelemetry.io/api/trace"
-	"go.opentelemetry.io/plugin/httptrace"
-  "go.opentelemetry.io/plugin/othttp"
 	"go.opentelemetry.io/exporter/trace/stdout"
+	"go.opentelemetry.io/plugin/httptrace"
+	"go.opentelemetry.io/plugin/othttp"
 )
 
 var (
@@ -41,24 +41,30 @@ var (
 )
 
 func main() {
+	sdktrace.Register()
+	sdktrace.ApplyConfig(sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()})
+
 	serviceName, _ := os.LookupEnv("PROJECT_NAME")
 
 	std, err := stdout.NewExporter(stdout.Options{PrettyPrint: true})
 	if err != nil {
 		log.Fatal(err)
 	}
-	sdktrace.RegisterSpanProcessor(sdktrace.NewSimpleSpanProcessor(std))
+	std.RegisterSimpleSpanProcessor()
 
 	apikey, _ := os.LookupEnv("HNY_KEY")
 	dataset, _ := os.LookupEnv("HNY_DATASET")
-	hny := honeycomb.NewExporter(honeycomb.Config{
+	hny, err := honeycomb.NewExporter(honeycomb.Config{
 		ApiKey:      apikey,
 		Dataset:     dataset,
-		Debug:       false,
+		Debug:       true,
 		ServiceName: serviceName,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer hny.Close()
-	hny.Register()
+	hny.RegisterSimpleSpanProcessor()
 
 	jaegerEndpoint, _ := os.LookupEnv("JAEGER_ENDPOINT")
 	jExporter, err := jaeger.NewExporter(
@@ -70,19 +76,19 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	sdktrace.RegisterSpanProcessor(sdktrace.NewSimpleSpanProcessor(jExporter))
+	jExporter.RegisterSimpleSpanProcessor()
 
 	mux := http.NewServeMux()
-  mux.Handle("/", othttp.NewHandler(http.HandlerFunc(rootHandler), "root"))
+	mux.Handle("/", othttp.NewHandler(http.HandlerFunc(rootHandler), "root"))
 	mux.Handle("/favicon.ico", http.NotFoundHandler())
-  // TODO(lizf): Pass WithPublicEndpoint() for /fib and no WithPublicEndpoint() for /fibinternal
-  mux.Handle("/fib", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci"))
+	// TODO(lizf): Pass WithPublicEndpoint() for /fib and no WithPublicEndpoint() for /fibinternal
+	mux.Handle("/fib", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci"))
 	mux.Handle("/quitquitquit", http.HandlerFunc(restartHandler))
 	os.Stderr.WriteString("Initializing the server...\n")
 
-	ctx := tag.NewContext(context.Background(),
-		tag.Insert(appKey.String(os.Getenv("PROJECT_DOMAIN"))),
-		tag.Insert(containerKey.String(os.Getenv("HOSTNAME"))),
+	ctx := distributedcontext.NewContext(context.Background(),
+		distributedcontext.Insert(appKey.String(os.Getenv("PROJECT_DOMAIN"))),
+		distributedcontext.Insert(containerKey.String(os.Getenv("HOSTNAME"))),
 	)
 
 	commonLabels := meter.DefineLabels(ctx, appKey.Int(10))
@@ -99,15 +105,15 @@ func main() {
 }
 
 func rootHandler(w http.ResponseWriter, req *http.Request) {
-  ctx := req.Context()
-  trace.CurrentSpan(ctx).AddEvent(ctx, "annotation within span")
+	ctx := req.Context()
+	trace.CurrentSpan(ctx).AddEvent(ctx, "annotation within span")
 	_ = dbHandler(ctx, "foo")
 
 	fmt.Fprintf(w, "Click [Tools] > [Logs] to see spans!")
 }
 
 func fibHandler(w http.ResponseWriter, req *http.Request) {
-  ctx := req.Context()
+	ctx := req.Context()
 	var err error
 	var i int
 	if len(req.URL.Query()["i"]) != 1 {
@@ -120,7 +126,7 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(503)
 		return
 	}
-  trace.CurrentSpan(ctx).SetAttribute(key.New("parameter").Int(i))
+	trace.CurrentSpan(ctx).SetAttribute(key.New("parameter").Int(i))
 	ret := 0
 	failed := false
 
@@ -136,7 +142,7 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 			go func(n int) {
 				err := trace.GlobalTracer().WithSpan(ctx, "fibClient", func(ctx context.Context) error {
 					url := fmt.Sprintf("http://localhost:3000/fib?i=%d", n)
-          trace.CurrentSpan(ctx).SetAttributes(key.New("url").String(url))
+					trace.CurrentSpan(ctx).SetAttributes(key.New("url").String(url))
 					req, _ := http.NewRequest("GET", url, nil)
 					ctx, req = httptrace.W3C(ctx, req)
 					httptrace.Inject(ctx, req)
@@ -154,7 +160,7 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 						return err
 					}
 					trace.CurrentSpan(ctx).SetStatus(codes.OK)
-          trace.CurrentSpan(ctx).SetAttributes(key.New("result").Int(resp))
+					trace.CurrentSpan(ctx).SetAttributes(key.New("result").Int(resp))
 					mtx.Lock()
 					defer mtx.Unlock()
 					ret += resp
@@ -172,7 +178,7 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 		}
 		wg.Wait()
 	}
-  trace.CurrentSpan(ctx).SetAttribute(key.New("result").Int(ret))
+	trace.CurrentSpan(ctx).SetAttribute(key.New("result").Int(ret))
 	fmt.Fprintf(w, "%d", ret)
 }
 
