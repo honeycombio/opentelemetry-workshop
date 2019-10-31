@@ -14,13 +14,15 @@ import (
 
 	"github.com/honeycombio/opentelemetry-exporter-go/honeycomb"
 	"go.opentelemetry.io/exporter/trace/jaeger"
+  "go.opentelemetry.io/exporter/trace/stackdriver"
 	sdktrace "go.opentelemetry.io/sdk/trace"
 	"google.golang.org/grpc/codes"
 
-	"go.opentelemetry.io/api/distributedcontext"
+  "go.opentelemetry.io/api/distributedcontext"
 	"go.opentelemetry.io/api/key"
 	"go.opentelemetry.io/api/metric"
 	"go.opentelemetry.io/api/trace"
+  "go.opentelemetry.io/global"
 	"go.opentelemetry.io/exporter/trace/stdout"
 	"go.opentelemetry.io/plugin/httptrace"
 	"go.opentelemetry.io/plugin/othttp"
@@ -29,29 +31,28 @@ import (
 var (
 	appKey         = key.New("honeycomb.io/glitch/app")          // The Glitch app name.
 	containerKey   = key.New("honeycomb.io/glitch/container_id") // The Glitch container id.
-	diskUsedMetric = metric.NewFloat64Gauge("honeycomb.io/glitch/disk_usage",
+  meter = metric.GlobalMeter()
+	diskUsedMetric = meter.NewFloat64Gauge("honeycomb.io/glitch/disk_usage",
 		metric.WithKeys(appKey, containerKey),
 		metric.WithDescription("Amount of disk used."),
 	)
-	diskQuotaMetric = metric.NewFloat64Gauge("honeycomb.io/glitch/disk_quota",
+	diskQuotaMetric = meter.NewFloat64Gauge("honeycomb.io/glitch/disk_quota",
 		metric.WithKeys(appKey, containerKey),
 		metric.WithDescription("Amount of disk quota available."),
 	)
-	meter = metric.GlobalMeter()
 )
 
 func main() {
-	sdktrace.Register()
-	sdktrace.ApplyConfig(sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()})
+  serviceName, _ := os.LookupEnv("PROJECT_NAME")
 
-	serviceName, _ := os.LookupEnv("PROJECT_NAME")
-
+  // stdout exporter
 	std, err := stdout.NewExporter(stdout.Options{PrettyPrint: true})
 	if err != nil {
 		log.Fatal(err)
 	}
-	std.RegisterSimpleSpanProcessor()
+  std.RegisterSimpleSpanProcessor()
 
+  // honeycomb exporter
 	apikey, _ := os.LookupEnv("HNY_KEY")
 	dataset, _ := os.LookupEnv("HNY_DATASET")
 	hny, err := honeycomb.NewExporter(honeycomb.Config{
@@ -64,8 +65,22 @@ func main() {
 		log.Fatal(err)
 	}
 	defer hny.Close()
-	hny.RegisterSimpleSpanProcessor()
+  hny.RegisterSimpleSpanProcessor()
+  
+  // Stackdriver exporter
+  // Crecential file specified in GOOGLE_APPLICATION_CREDENTIALS in .env is automatically detected.
+  sdExporter, err := stackdriver.NewExporter()
+  if err != nil {
+    log.Fatal(err)
+  }
+  sdTp, err := sdktrace.NewProvider(sdktrace.WithConfig(sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()}),
+		sdktrace.WithSyncer(sdExporter))
+  if err != nil {
+    log.Fatal(err)
+  }
+  global.SetTraceProvider(sdTp)
 
+  // jaeger exporter
 	jaegerEndpoint, _ := os.LookupEnv("JAEGER_ENDPOINT")
 	jExporter, err := jaeger.NewExporter(
 		jaeger.WithCollectorEndpoint(jaegerEndpoint),
@@ -77,12 +92,21 @@ func main() {
 		log.Fatal(err)
 	}
 	jExporter.RegisterSimpleSpanProcessor()
+  
+  tp, err := sdktrace.NewProvider(sdktrace.WithConfig(sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()}),
+		sdktrace.WithSyncer(std), sdktrace.WithSyncer(hny), sdktrace.WithSyncer(jExporter))
+	if err != nil {
+		log.Fatal(err)
+	}
+  global.SetTraceProvider(tp)
+
 
 	mux := http.NewServeMux()
 	mux.Handle("/", othttp.NewHandler(http.HandlerFunc(rootHandler), "root"))
 	mux.Handle("/favicon.ico", http.NotFoundHandler())
 	// TODO(lizf): Pass WithPublicEndpoint() for /fib and no WithPublicEndpoint() for /fibinternal
-	mux.Handle("/fib", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci"))
+	mux.Handle("/fib", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci", othttp.WithPublicEndpoint()))
+	mux.Handle("/fibinternal", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci"))
 	mux.Handle("/quitquitquit", http.HandlerFunc(restartHandler))
 	os.Stderr.WriteString("Initializing the server...\n")
 
@@ -91,10 +115,10 @@ func main() {
 		distributedcontext.Insert(containerKey.String(os.Getenv("HOSTNAME"))),
 	)
 
-	commonLabels := meter.DefineLabels(ctx, appKey.Int(10))
+	commonLabels := meter.Labels(ctx, appKey.Int(10))
 
-	used := diskUsedMetric.GetHandle(commonLabels)
-	quota := diskQuotaMetric.GetHandle(commonLabels)
+	used := diskUsedMetric.AcquireHandle(commonLabels)
+	quota := diskQuotaMetric.AcquireHandle(commonLabels)
 
 	go updateDiskMetrics(ctx, used, quota)
 
@@ -114,6 +138,7 @@ func rootHandler(w http.ResponseWriter, req *http.Request) {
 
 func fibHandler(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
+  tr := global.TraceProvider().GetTracer("fibHandler")
 	var err error
 	var i int
 	if len(req.URL.Query()["i"]) != 1 {
@@ -140,9 +165,10 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 		for offset := 1; offset < 3; offset++ {
 			wg.Add(1)
 			go func(n int) {
-				err := trace.GlobalTracer().WithSpan(ctx, "fibClient", func(ctx context.Context) error {
-					url := fmt.Sprintf("http://localhost:3000/fib?i=%d", n)
+				err := tr.WithSpan(ctx, "fibClient", func(ctx context.Context) error {
+					url := fmt.Sprintf("http://localhost:3000/fibinternal?i=%d", n)
 					trace.CurrentSpan(ctx).SetAttributes(key.New("url").String(url))
+          trace.CurrentSpan(ctx).AddEvent(ctx, "Fib loop count", key.New("fib-loop").Int(n))
 					req, _ := http.NewRequest("GET", url, nil)
 					ctx, req = httptrace.W3C(ctx, req)
 					httptrace.Inject(ctx, req)
@@ -197,7 +223,8 @@ func updateDiskMetrics(ctx context.Context, used, quota metric.Float64GaugeHandl
 }
 
 func dbHandler(ctx context.Context, color string) int {
-	ctx, span := trace.GlobalTracer().Start(ctx, "database")
+  tr := global.TraceProvider().GetTracer("dbHandler")
+	ctx, span := tr.Start(ctx, "database")
 	defer span.End()
 
 	// Pretend we talked to a database here.
