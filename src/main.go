@@ -31,7 +31,7 @@ import (
 var (
 	appKey         = key.New("honeycomb.io/glitch/app")          // The Glitch app name.
 	containerKey   = key.New("honeycomb.io/glitch/container_id") // The Glitch container id.
-  meter = metric.GlobalMeter()
+  meter = global.MeterProvider().GetMeter("main")
 	diskUsedMetric = meter.NewFloat64Gauge("honeycomb.io/glitch/disk_usage",
 		metric.WithKeys(appKey, containerKey),
 		metric.WithDescription("Amount of disk used."),
@@ -104,18 +104,17 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", othttp.NewHandler(http.HandlerFunc(rootHandler), "root"))
 	mux.Handle("/favicon.ico", http.NotFoundHandler())
-	// TODO(lizf): Pass WithPublicEndpoint() for /fib and no WithPublicEndpoint() for /fibinternal
 	mux.Handle("/fib", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci", othttp.WithPublicEndpoint()))
 	mux.Handle("/fibinternal", othttp.NewHandler(http.HandlerFunc(fibHandler), "fibonacci"))
 	mux.Handle("/quitquitquit", http.HandlerFunc(restartHandler))
 	os.Stderr.WriteString("Initializing the server...\n")
 
 	ctx := distributedcontext.NewContext(context.Background(),
-		distributedcontext.Insert(appKey.String(os.Getenv("PROJECT_DOMAIN"))),
-		distributedcontext.Insert(containerKey.String(os.Getenv("HOSTNAME"))),
+		appKey.String(os.Getenv("PROJECT_DOMAIN")),
+		containerKey.String(os.Getenv("HOSTNAME")),
 	)
 
-	commonLabels := meter.Labels(ctx, appKey.Int(10))
+	commonLabels := meter.Labels(appKey.Int(10))
 
 	used := diskUsedMetric.AcquireHandle(commonLabels)
 	quota := diskQuotaMetric.AcquireHandle(commonLabels)
